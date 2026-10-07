@@ -2,11 +2,11 @@
 
 // FLOWER ROOM
 // A pink room under a projected moving sky, a green carpet meadow,
-// hundreds of oversized realistic flowers, stepping stones, and scalloped mirrors.
+// a meadow of flowers loaded from GLB models, stepping stones, and scalloped mirrors.
 
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { Suspense, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
-import { MeshReflectorMaterial } from '@react-three/drei';
+import { MeshReflectorMaterial, useGLTF } from '@react-three/drei';
 import { fuzzTexture, roomSurfaces, seededRandom } from './sceneUtils';
 import { SkyCeiling } from './SkyCeiling';
 import { CurvedSofa, Ottoman } from './LoungeSeating';
@@ -37,266 +37,134 @@ function Stones() {
   );
 }
 
-/* ---------- FLOWERS ---------- */
-// Four kinds of flowers (daisies, lilies, tulips and peonies), built from curved,
-// tapered petals with a soft color gradient, plus leaves and stamens.
-// Everything is "instanced": each part type is drawn in one go, so hundreds of
-// flowers stay fast enough for VR.
+/* ---------- FLOWERS (your downloaded GLB models) ---------- */
+// Put your three .glb files in the project's  public/models/  folder
+// and make sure the names below match your file names exactly.
+
+const FLOWER_MODELS = ['/models/flower2.glb', '/models/flower3.glb', '/models/flower4.glb', '/models/flower5.glb'];
+
+const FLOWER_COUNT = 120;          // how many flowers in total
+const MIN_HEIGHT = 0.5;            // shortest flower, in meters
+const MAX_HEIGHT = 1.4;            // tallest flower, in meters
 
 /*
-  Builds one petal (or leaf) shape: a thin sheet that tapers to a point,
-  cups sideways and bends along its length. It points along +Z from the origin.
-  Vertex colors darken the base slightly so each petal has a natural gradient.
+  Loads a GLB and prepares it for instancing:
+  - finds every mesh inside the model
+  - scales the whole model to exactly 1 m tall
+  - sits its base on the ground and centers it
+  Each mesh becomes one "part" that can be drawn hundreds of times in one go.
 */
-function petalGeometry({
-  width,     // half-width relative to length
-  peak,      // where the petal is widest (lower = near base, higher = near tip)
-  cup,       // how much the sides curl up
-  curl,      // how much the petal bends up (+) or back (-) along its length
-  baseShade, // brightness at the base (tip is 1)
-}: {
-  width: number;
-  peak: number;
-  cup: number;
-  curl: number;
-  baseShade: number;
-}) {
-  const geo = new THREE.PlaneGeometry(1, 1, 4, 10);
-  geo.translate(0, 0.5, 0);
-  const pos = geo.attributes.position;
-  const colors: number[] = [];
+function usePreparedFlower(url: string) {
+  const { scene } = useGLTF(url);
 
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i); // -0.5 to 0.5 across
-    const t = pos.getY(i); // 0 (base) to 1 (tip)
-    const shape = Math.max(Math.sin(Math.PI * Math.pow(t, peak)), 0.12 * (1 - t));
-    const w = width * shape;
-    const nx = x * 2 * w;
-    const z = cup * (x * 2) ** 2 * w + curl * t * t;
-    pos.setXYZ(i, nx, t, z);
+  const parts = useMemo(() => {
+    scene.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(scene);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const scale = 1 / (size.y || 1);
 
-    // Darker at the base, with a faint lighter vein down the middle
-    const shade = baseShade + (1 - baseShade) * t;
-    const vein = 1 + 0.06 * (1 - Math.abs(x) * 2);
-    colors.push(shade * vein, shade * vein, shade * vein);
-  }
+    // Moves the model so its base is at y = 0 and it is 1 m tall
+    const normalize = new THREE.Matrix4()
+      .makeScale(scale, scale, scale)
+      .multiply(new THREE.Matrix4().makeTranslation(-center.x, -box.min.y, -center.z));
 
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  geo.rotateX(-Math.PI / 2); // lay it flat, cup facing up
-  geo.rotateY(Math.PI);      // point the tip along +Z
-  geo.computeVertexNormals();
-  return geo;
-}
+    const list: { geometry: THREE.BufferGeometry; material: THREE.Material | THREE.Material[] }[] = [];
+    scene.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const geometry = mesh.geometry.clone();
+      geometry.applyMatrix4(new THREE.Matrix4().multiplyMatrices(normalize, mesh.matrixWorld));
+      list.push({ geometry, material: mesh.material });
+    });
+    return list;
+  }, [scene]);
 
-type Item = { m: THREE.Matrix4; c: THREE.Color };
-type FlowerParts = {
-  stems: Item[];
-  leaves: Item[];
-  daisyPetals: Item[];
-  lilyPetals: Item[];
-  cupPetals: Item[];
-  centers: Item[];
-  stamens: Item[];
-  anthers: Item[];
-};
-
-const COLORS = {
-  daisy: ['#ffffff', '#fdf6ec', '#f9c9d8', '#f7d84b', '#c9b6f2'],
-  daisyCenter: ['#f2b52a', '#e9a21b', '#5b3a1e'],
-  lily: ['#f48fb1', '#ffffff', '#f5873b', '#e0407a', '#fbd3e2', '#b38be8'],
-  tulip: ['#d7263d', '#f6c945', '#f06a99', '#7b4fc9', '#f28b3a', '#fff1f4'],
-  peony: ['#f7c6cf', '#e05a8a', '#f4876f', '#fbefe6', '#c2185b'],
-  leaf: ['#3f8f3a', '#4ea345', '#2f7a33', '#5bb04d'],
-};
-
-function buildFlowers(): FlowerParts {
-  const rand = seededRandom(11);
-  const pick = (list: string[]) => new THREE.Color(list[Math.floor(rand() * list.length)]);
-  const vary = (c: THREE.Color, amount = 0.05) =>
-    c.clone().offsetHSL((rand() - 0.5) * 0.02, (rand() - 0.5) * 0.1, (rand() - 0.5) * amount);
-
-  const parts: FlowerParts = {
-    stems: [], leaves: [], daisyPetals: [], lilyPetals: [],
-    cupPetals: [], centers: [], stamens: [], anthers: [],
-  };
-  const local = new THREE.Object3D();
-
-  // Places a part relative to the flower head
-  const atHead = (head: THREE.Matrix4, list: Item[], color: THREE.Color) => {
-    local.updateMatrix();
-    list.push({ m: new THREE.Matrix4().multiplyMatrices(head, local.matrix), c: color });
-  };
-
-  let placed = 0;
-  let tries = 0;
-  while (placed < 260 && tries < 5000) {
-    tries++;
-    const x = (rand() - 0.5) * (W - 0.4);
-    const z = (rand() - 0.5) * (D - 1.2) + 0.2;
-    if (Math.abs(x - pathX(z)) < 0.6 && z < 4.6) continue; // keep the path clear
-    if (z < -4.3) continue;                                // keep the mirrors clear
-    if (CLEARINGS.some((c) => Math.hypot(x - c.x, z - c.z) < c.r)) continue; // keep seats clear
-    placed++;
-
-    const height = 0.35 + rand() * 1.15;
-    const size = 0.8 + rand() * (z > 2.5 ? 1.0 : 0.6); // bigger flowers near the front
-    const lean = new THREE.Euler((rand() - 0.5) * 0.25, 0, (rand() - 0.5) * 0.25);
-    const base = new THREE.Vector3(x, 0, z);
-    const up = new THREE.Vector3(0, 1, 0).applyEuler(lean);
-    const headPos = base.clone().addScaledVector(up, height);
-
-    /* Stem */
-    local.position.copy(base);
-    local.rotation.copy(lean);
-    local.scale.set(0.007, height, 0.007);
-    local.updateMatrix();
-    parts.stems.push({ m: local.matrix.clone(), c: new THREE.Color('#3f8f3a') });
-
-    /* Leaves along the stem */
-    const leafCount = 1 + Math.floor(rand() * 3);
-    for (let l = 0; l < leafCount; l++) {
-      local.position.copy(base).addScaledVector(up, height * (0.15 + rand() * 0.4));
-      local.rotation.set(0, rand() * Math.PI * 2, 0);
-      local.rotateX(-(0.5 + rand() * 0.5));
-      local.scale.setScalar((0.16 + rand() * 0.14) * Math.min(size, 1.3));
-      local.updateMatrix();
-      parts.leaves.push({ m: local.matrix.clone(), c: vary(pick(COLORS.leaf)) });
-    }
-
-    /* Flower head: tipped slightly, so flowers face different ways */
-    const nod = new THREE.Euler(lean.x + (rand() - 0.5) * 0.7, rand() * Math.PI * 2, lean.z + (rand() - 0.5) * 0.7);
-    const head = new THREE.Matrix4().compose(headPos, new THREE.Quaternion().setFromEuler(nod), new THREE.Vector3(1, 1, 1));
-    const spin = rand() * Math.PI * 2;
-    const kind = rand();
-
-    // Adds a ring of petals around the head
-    const ring = (list: Item[], count: number, tilt: number, len: number, color: THREE.Color, offset = 0) => {
-      for (let p = 0; p < count; p++) {
-        local.position.set(0, 0, 0);
-        local.rotation.set(0, spin + offset + (p / count) * Math.PI * 2 + (rand() - 0.5) * 0.15, 0);
-        local.rotateX(-(tilt + (rand() - 0.5) * 0.15));
-        local.scale.setScalar(len * (0.9 + rand() * 0.2));
-        atHead(head, list, vary(color));
-      }
-    };
-
-    if (kind < 0.3) {
-      /* DAISY: many slim petals, almost flat, with a domed center */
-      const color = pick(COLORS.daisy);
-      ring(parts.daisyPetals, 14 + Math.floor(rand() * 6), 0.15, 0.09 * size, color);
-      local.position.set(0, 0.006 * size, 0);
-      local.rotation.set(0, 0, 0);
-      local.scale.set(0.025 * size, 0.014 * size, 0.025 * size);
-      atHead(head, parts.centers, pick(COLORS.daisyCenter));
-    } else if (kind < 0.55) {
-      /* LILY: six long petals that open up and curl back, with long stamens */
-      const color = pick(COLORS.lily);
-      ring(parts.lilyPetals, 3, 0.75, 0.15 * size, color);
-      ring(parts.lilyPetals, 3, 0.85, 0.14 * size, color, Math.PI / 3);
-      for (let s = 0; s < 6; s++) {
-        const len = 0.11 * size;
-        local.position.set(0, 0, 0);
-        local.rotation.set(0, spin + (s / 6) * Math.PI * 2, 0);
-        local.rotateX(0.45);
-        local.scale.set(0.003, len, 0.003);
-        atHead(head, parts.stamens, new THREE.Color('#e8d9a8'));
-        local.translateY(len);
-        local.scale.set(0.006, 0.006, 0.014);
-        atHead(head, parts.anthers, new THREE.Color(rand() > 0.5 ? '#b5502a' : '#7a2e1c'));
-      }
-    } else if (kind < 0.8) {
-      /* TULIP: two layers of wide cupped petals standing almost upright */
-      const color = pick(COLORS.tulip);
-      ring(parts.cupPetals, 3, 1.2, 0.075 * size, color);
-      ring(parts.cupPetals, 3, 1.3, 0.07 * size, color.clone().offsetHSL(0, 0, -0.04), Math.PI / 3);
-    } else {
-      /* PEONY: layered rings, tighter and smaller toward the middle */
-      const color = pick(COLORS.peony);
-      ring(parts.cupPetals, 7, 0.35, 0.075 * size, color);
-      ring(parts.cupPetals, 6, 0.75, 0.062 * size, color.clone().offsetHSL(0, 0, 0.03), 0.4);
-      ring(parts.cupPetals, 5, 1.1, 0.048 * size, color.clone().offsetHSL(0, 0, 0.06), 0.8);
-      local.position.set(0, 0.01 * size, 0);
-      local.rotation.set(0, 0, 0);
-      local.scale.setScalar(0.014 * size);
-      atHead(head, parts.centers, new THREE.Color('#f6dd7a'));
-    }
-  }
+  useEffect(() => () => parts.forEach((p) => p.geometry.dispose()), [parts]);
   return parts;
 }
 
-/* Draws a list of items with one shared geometry */
-function Instanced({
-  items,
+/* Decides where every flower goes, and which of the three models it uses */
+function buildPlacements() {
+  const rand = seededRandom(11);
+  const byModel: THREE.Matrix4[][] = FLOWER_MODELS.map(() => []);
+  const dummy = new THREE.Object3D();
+
+  let placed = 0;
+  let tries = 0;
+  while (placed < FLOWER_COUNT && tries < 5000) {
+    tries++;
+    const x = (rand() - 0.5) * (W - 0.4);
+    const z = (rand() - 0.5) * (D - 1.2) + 0.2;
+    if (Math.abs(x - pathX(z)) < 0.6 && z < 4.6) continue;                   // keep the path clear
+    if (z < -4.3) continue;                                                 // keep the mirrors clear
+    if (CLEARINGS.some((c) => Math.hypot(x - c.x, z - c.z) < c.r)) continue; // keep seats clear
+    placed++;
+
+    // Taller flowers toward the front of the room, like the reference photo
+    const frontBoost = z > 2.5 ? 0.25 : 0;
+    const height = MIN_HEIGHT + rand() * (MAX_HEIGHT - MIN_HEIGHT) + frontBoost;
+
+    dummy.position.set(x, 0, z);
+    dummy.rotation.set((rand() - 0.5) * 0.2, rand() * Math.PI * 2, (rand() - 0.5) * 0.2); // slight lean, random turn
+    dummy.scale.setScalar(height);
+    dummy.updateMatrix();
+
+    byModel[Math.floor(rand() * FLOWER_MODELS.length)].push(dummy.matrix.clone());
+  }
+  return byModel;
+}
+
+/* Draws one mesh of a model at many positions */
+function InstancedPart({
   geometry,
-  vertexColors = false,
-  doubleSide = false,
-  roughness = 0.6,
+  material,
+  matrices,
 }: {
-  items: Item[];
   geometry: THREE.BufferGeometry;
-  vertexColors?: boolean;
-  doubleSide?: boolean;
-  roughness?: number;
+  material: THREE.Material | THREE.Material[];
+  matrices: THREE.Matrix4[];
 }) {
   const ref = useRef<THREE.InstancedMesh>(null);
 
   useLayoutEffect(() => {
     const mesh = ref.current;
     if (!mesh) return;
-    items.forEach(({ m, c }, i) => {
-      mesh.setMatrixAt(i, m);
-      mesh.setColorAt(i, c);
-    });
+    matrices.forEach((m, i) => mesh.setMatrixAt(i, m));
     mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }, [items]);
+    mesh.computeBoundingSphere();
+  }, [matrices]);
 
-  if (items.length === 0) return null;
+  if (matrices.length === 0) return null;
+  return <instancedMesh ref={ref} args={[geometry, material, matrices.length]} />;
+}
+
+/* All copies of one flower model */
+function FlowerModel({ url, matrices }: { url: string; matrices: THREE.Matrix4[] }) {
+  const parts = usePreparedFlower(url);
   return (
-    <instancedMesh ref={ref} args={[geometry, undefined, items.length]}>
-      <meshStandardMaterial
-        vertexColors={vertexColors}
-        side={doubleSide ? THREE.DoubleSide : THREE.FrontSide}
-        roughness={roughness}
-      />
-    </instancedMesh>
+    <group>
+      {parts.map((p, i) => (
+        <InstancedPart key={i} geometry={p.geometry} material={p.material} matrices={matrices} />
+      ))}
+    </group>
   );
 }
 
 function Flowers() {
-  const parts = useMemo(buildFlowers, []);
-
-  const geo = useMemo(() => {
-    const stem = new THREE.CylinderGeometry(0.7, 1, 1, 6);
-    stem.translate(0, 0.5, 0); // base at the ground, grows upward
-    const stamen = new THREE.CylinderGeometry(1, 1, 1, 4);
-    stamen.translate(0, 0.5, 0);
-    return {
-      stem,
-      stamen,
-      sphere: new THREE.SphereGeometry(1, 12, 8),
-      daisy: petalGeometry({ width: 0.14, peak: 1.0, cup: 0.25, curl: 0.05, baseShade: 0.85 }),
-      lily: petalGeometry({ width: 0.17, peak: 0.9, cup: 0.35, curl: -0.3, baseShade: 0.7 }),
-      cup: petalGeometry({ width: 0.42, peak: 1.5, cup: 0.45, curl: 0.12, baseShade: 0.72 }),
-      leaf: petalGeometry({ width: 0.16, peak: 1.0, cup: 0.3, curl: -0.25, baseShade: 0.8 }),
-    };
-  }, []);
-
-  useEffect(() => () => Object.values(geo).forEach((g) => g.dispose()), [geo]);
-
+  const placements = useMemo(buildPlacements, []);
   return (
-    <group>
-      <Instanced items={parts.stems} geometry={geo.stem} roughness={0.8} />
-      <Instanced items={parts.leaves} geometry={geo.leaf} vertexColors doubleSide roughness={0.7} />
-      <Instanced items={parts.daisyPetals} geometry={geo.daisy} vertexColors doubleSide />
-      <Instanced items={parts.lilyPetals} geometry={geo.lily} vertexColors doubleSide />
-      <Instanced items={parts.cupPetals} geometry={geo.cup} vertexColors doubleSide />
-      <Instanced items={parts.centers} geometry={geo.sphere} roughness={0.9} />
-      <Instanced items={parts.stamens} geometry={geo.stamen} />
-      <Instanced items={parts.anthers} geometry={geo.sphere} roughness={0.9} />
-    </group>
+    // Suspense shows nothing until the models finish loading, instead of crashing
+    <Suspense fallback={null}>
+      {FLOWER_MODELS.map((url, i) => (
+        <FlowerModel key={url} url={url} matrices={placements[i]} />
+      ))}
+    </Suspense>
   );
 }
+
+// Start downloading the models as soon as the page loads
+FLOWER_MODELS.forEach((url) => useGLTF.preload(url));
 
 /* ---------- SEATING ---------- */
 // A small clearing near the front of the room with a curved sofa and ottomans.
